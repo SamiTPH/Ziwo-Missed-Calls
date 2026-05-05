@@ -235,19 +235,29 @@ function formatCardText(value) {
   return String(value ?? '').replace(/\r?\n/g, ' ').trim()
 }
 
+function formatRingTime(startedAt, endedAt) {
+  const startedAtMs = Date.parse(startedAt)
+  const endedAtMs = Date.parse(endedAt)
+
+  if (Number.isNaN(startedAtMs) || Number.isNaN(endedAtMs) || endedAtMs < startedAtMs) {
+    return 'unknown'
+  }
+
+  const totalSeconds = Math.floor((endedAtMs - startedAtMs) / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+
+  return `${minutes} minute${minutes === 1 ? '' : 's'} ${seconds} second${seconds === 1 ? '' : 's'}`
+}
+
 async function formatTeamsWorkflowPayload(accessToken, cdr) {
   const call = await summarizeCall(accessToken, cdr)
   const facts = [
-    { title: 'Call ID', value: call.callID },
-    { title: 'Result', value: call.result },
-    { title: 'Direction', value: call.direction },
-    { title: 'Started', value: call.startedAtLocal },
-    { title: 'Ended', value: call.endedAtLocal },
-    { title: 'Caller', value: call.callerIDNumber },
-    { title: 'DID', value: call.didCalled },
-    { title: 'Queue', value: call.queueName || 'none' },
-    { title: 'Agent ID', value: call.agentId },
-    { title: 'Agent', value: call.agentName || 'none' },
+    { title: 'Time Started', value: call.startedAtLocal },
+    { title: 'Time Ended', value: call.endedAtLocal },
+    { title: 'Ring Time', value: formatRingTime(call.startedAt, call.endedAt) },
+    { title: 'Caller Number', value: call.callerIDNumber },
+    { title: 'Agent', value: call.agentName || "call didn't reach an agent" },
   ]
     .filter(({ value }) => value)
     .map(({ title, value }) => ({
@@ -268,7 +278,7 @@ async function formatTeamsWorkflowPayload(accessToken, cdr) {
           body: [
             {
               type: 'TextBlock',
-              text: 'Missed Ziwo call',
+              text: 'Title',
               weight: 'Bolder',
               size: 'Medium',
             },
