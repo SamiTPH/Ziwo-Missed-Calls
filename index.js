@@ -510,6 +510,7 @@ async function summarizeCall(accessToken, cdr) {
     startedAtLocal: formatDateTime(cdr.startedAt),
     endedAt: cdr.endedAt,
     endedAtLocal: formatDateTime(cdr.endedAt),
+    ringTime: cdr.ringTime,
     displayTimeZone,
     callerIDNumber: getCallerNumber(cdr),
     didCalled: cdr.didCalled,
@@ -560,17 +561,20 @@ function formatCardText(value) {
   return String(value ?? '').replace(/\r?\n/g, ' ').trim()
 }
 
-function formatRingTime(startedAt, endedAt) {
-  const startedAtMs = Date.parse(startedAt)
-  const endedAtMs = Date.parse(endedAt)
-
-  if (Number.isNaN(startedAtMs) || Number.isNaN(endedAtMs) || endedAtMs < startedAtMs) {
+function formatRingTime(ringTime) {
+  if (ringTime === null || ringTime === undefined || ringTime === '') {
     return 'unknown'
   }
 
-  const totalSeconds = Math.floor((endedAtMs - startedAtMs) / 1000)
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
+  const totalSeconds = Number(ringTime)
+
+  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
+    return 'unknown'
+  }
+
+  const wholeSeconds = Math.floor(totalSeconds)
+  const minutes = Math.floor(wholeSeconds / 60)
+  const seconds = wholeSeconds % 60
 
   return `${minutes} minute${minutes === 1 ? '' : 's'} ${seconds} second${seconds === 1 ? '' : 's'}`
 }
@@ -634,7 +638,7 @@ async function formatTeamsWorkflowPayload(accessToken, cdr) {
   const facts = [
     { title: 'Time Started', value: call.startedAtLocal },
     { title: 'Time Ended', value: call.endedAtLocal },
-    { title: 'Ring Time', value: formatRingTime(call.startedAt, call.endedAt) },
+    { title: 'Ring Time', value: formatRingTime(call.ringTime) },
     { title: 'Caller Number', value: call.callerIDNumber },
     { title: 'Agent', value: call.agentName || "call didn't reach an agent" },
     { title: 'Last Contacted', value: lastContactedLabel },

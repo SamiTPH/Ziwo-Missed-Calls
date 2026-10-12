@@ -165,7 +165,7 @@ The Teams card includes:
 
 - Time started
 - Time ended
-- Ring time
+- Ring time, using Ziwo's `ringTime` CDR value (seconds)
 - Caller number
 - Agent, or `call didn't reach an agent`
 - Last contacted agent, when fallback history was used
