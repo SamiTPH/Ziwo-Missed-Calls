@@ -1,18 +1,18 @@
 # Ziwo Missed Call Notifier
 
-This script listens for live Ziwo call-history events, detects inbound canceled calls, and sends missed-call notifications to the correct Microsoft Teams Workflow webhook.
+This script listens for live Ziwo call-history events and sends missed-call notifications to the correct Microsoft Teams Workflow webhook.
 
-Routing is based on the agent ID from the agents/teams Excel sheet. Queue names are not used for routing.
+Presales routing uses the agent ID from the agents/teams Excel sheet. After Sales and CMR notifications use verified Ziwo CallFlow transfers to their configured queues or agents.
 
 ## What It Does
 
 1. Logs in to the Ziwo API using `ZIWO_USERNAME` and `ZIWO_PASSWORD`.
 2. Connects to the Ziwo socket endpoint and subscribes to `GET /callHistory`.
 3. When Ziwo emits a new call-history event, fetches the full CDR by `callID`.
-4. Checks whether the call is an inbound canceled call.
-5. Finds the agent assigned to the call.
-6. Looks up that agent ID in the agents/teams Excel sheet.
-7. Sends a Microsoft Teams Workflow notification to the webhook configured for that team.
+4. Reads the call's Ziwo CallFlow to find unanswered Sales transfers to After Sales or CMR.
+5. Otherwise checks whether the call is an inbound canceled call for the existing Presales flow.
+6. Looks up agent IDs in the agents/teams Excel sheet.
+7. Sends a Microsoft Teams Workflow notification to the appropriate team webhook.
 
 If a missed call did not reach an agent, the script looks up the caller's previous call history:
 
@@ -20,9 +20,9 @@ If a missed call did not reach an agent, the script looks up the caller's previo
 GET /callHistory/?contactNumber=<caller number>&limit=20&skip=0
 ```
 
-It then finds the latest previous call that had an agent, looks up that agent ID in the sheet, and routes the notification to that agent's team.
+It then finds the latest previous call that had an agent, looks up that agent ID in the sheet, and routes the notification to that agent's team. This historical fallback is disabled for After Sales and CMR.
 
-For these fallback notifications, the card includes:
+For Presales fallback notifications, the card includes:
 
 ```text
 Call didn't reach queue / agent, client last contacted <agent name>
@@ -53,6 +53,8 @@ CMR
 CMR Team
 ```
 
+After Sales and CMR are stricter: a legacy current-agent or historical-agent match cannot send to their webhooks. The call must contain a verified Sales transfer to the destination queue or agent, and nobody in that destination team may have answered.
+
 ## Required Environment Variables
 
 Create a `.env` file using `.env.example` as the template.
@@ -66,6 +68,9 @@ ZIWO_PASSWORD=
 ZIWO_CANCEL_RESULTS=cancel
 ZIWO_DISPLAY_TIMEZONE=Asia/Dubai
 ZIWO_AGENT_CACHE_TTL_SECONDS=900
+AFTER_SALES_QUEUE_IDS=8
+CMR_QUEUE_IDS=9
+TRANSFER_CALLFLOW_RETRY_DELAYS_MS=1000,3000
 ```
 
 `ZIWO_INSTANCE` can be either the full API URL or the instance prefix. For example, both of these are valid:
@@ -153,6 +158,13 @@ Fetch Ziwo agents for agent ID to display-name fallback:
 GET /callHistory/listAgents?deleted=false
 ```
 
+Fetch CallFlow stages and nested multi-agent offers:
+
+```text
+GET /callHistory/<callID>/callflow?limit=100&skip=0
+GET /callHistory/<callID>/callflow?limit=100&skip=0&parentId=<stage id>
+```
+
 All Ziwo API calls use:
 
 ```text
@@ -160,6 +172,8 @@ access_token: <Ziwo access token>
 ```
 
 ## Notification Contents
+
+Presales cards include:
 
 The Teams card includes:
 
@@ -171,6 +185,17 @@ The Teams card includes:
 - Last contacted agent, when fallback history was used
 - Team
 
+After Sales and CMR transfer cards include:
+
+- Time started
+- Time ended
+- Caller number
+- Every actual agent ring attempt in chronological order
+- Actual ring seconds beside the final attempt only
+- Team
+
+After Sales and CMR transfer cards do not contain the historical `Last Contacted` field or the call-level `ringTime`.
+
 ## Skip Conditions
 
 The script skips sending a Teams message when:
@@ -179,6 +204,9 @@ The script skips sending a Teams message when:
 - The call has no agent and no previous call with an agent was found.
 - The agent ID cannot be matched to a team in the sheet.
 - No webhook URL is configured for the matched team.
+- An After Sales or CMR route came only from current/historical agent matching rather than a verified Sales transfer.
+- An agent in the destination team ultimately answered the transfer.
+- Transfer CallFlow evidence is incomplete.
 
 ## Verification
 
@@ -186,4 +214,10 @@ To check JavaScript syntax without starting the listener:
 
 ```powershell
 node --check .\index.js
+```
+
+Run the local tests without starting the listener:
+
+```powershell
+npm test
 ```

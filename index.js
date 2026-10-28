@@ -2,8 +2,11 @@ require('dotenv').config()
 
 const axios = require('axios')
 const io = require('socket.io-client')
+const { buildActiveTeamMaps, interpretSalesTransferCall, resolveTransferCallFlow } = require('./after-sales-call')
+const { formatTransferWorkflowPayload } = require('./after-sales-card')
+const { deliverTransferHandoffs } = require('./transfer-delivery')
 
-const appVersion = 'teams-workflow-team-routing-v6'
+const appVersion = 'teams-workflow-team-routing-v8'
 const graphBaseUrl = 'https://graph.microsoft.com/v1.0'
 
 function requireEnv(name) {
@@ -48,6 +51,26 @@ const cancelResults = (process.env.ZIWO_CANCEL_RESULTS || 'cancel')
   .map((result) => result.trim())
   .filter(Boolean)
 const displayTimeZone = process.env.ZIWO_DISPLAY_TIMEZONE || 'Asia/Dubai'
+const afterSalesQueueIds = (process.env.AFTER_SALES_QUEUE_IDS || '8')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean)
+const cmrQueueIds = (process.env.CMR_QUEUE_IDS || '9')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean)
+const transferCallFlowRetryDelaysMs = (
+  process.env.TRANSFER_CALLFLOW_RETRY_DELAYS_MS
+  || process.env.AFTER_SALES_CALLFLOW_RETRY_DELAYS_MS
+  || '1000,3000'
+)
+  .split(',')
+  .map((delay) => Number(delay.trim()))
+  .filter((delay) => Number.isFinite(delay) && delay >= 0)
+const transferTeamConfigs = [
+  { team: 'after_sales', queueIds: afterSalesQueueIds },
+  { team: 'cmr', queueIds: cmrQueueIds },
+]
 const dateTimeFormatter = new Intl.DateTimeFormat('en-AE', {
   dateStyle: 'medium',
   timeStyle: 'medium',
@@ -62,6 +85,7 @@ const teamsWebhookUrlsByTeam = new Map([
 const agentCacheTtlMs = Number(process.env.ZIWO_AGENT_CACHE_TTL_SECONDS || 900) * 1000
 const agentDirectory = {
   agentsById: new Map(),
+  agentsByCcLogin: new Map(),
   expiresAt: 0,
   refreshPromise: null,
 }
@@ -73,6 +97,8 @@ const agentTeamDirectory = {
   expiresAt: 0,
   refreshPromise: null,
 }
+const deliveredTransferHandoffs = new Set()
+const inFlightTransferHandoffs = new Set()
 
 function isTeamsConfigured() {
   return teamsWebhookUrlsByTeam.size > 0
@@ -335,6 +361,51 @@ async function fetchCallsByCallerNumber(accessToken, callerNumber) {
   return []
 }
 
+async function fetchCallFlowPage(accessToken, callID, skip = 0, parentId = null) {
+  const params = new URLSearchParams()
+  params.set('limit', '100')
+  params.set('skip', String(skip))
+  if (parentId !== null && parentId !== undefined) {
+    params.set('parentId', String(parentId))
+  }
+
+  const { data } = await axios.get(
+    `${baseUrl}/callHistory/${encodeURIComponent(callID)}/callflow?${params}`,
+    { headers: { access_token: accessToken } }
+  )
+
+  return data.content || []
+}
+
+async function fetchCompleteCallFlow(accessToken, callID, parentId = null) {
+  const events = []
+
+  for (let skip = 0; skip < 1000; skip += 100) {
+    const page = await fetchCallFlowPage(accessToken, callID, skip, parentId)
+    events.push(...page)
+    if (page.length < 100) {
+      return events
+    }
+  }
+
+  throw new Error(`CallFlow pagination exceeded 1000 events for callID=${callID}`)
+}
+
+async function fetchCallFlowWithNestedOffers(accessToken, callID) {
+  const events = await fetchCompleteCallFlow(accessToken, callID)
+  const nestedEvents = {}
+  const multiAgentStages = events.filter(({ type }) => (
+    type === 'queue-multiagent-offering-start'
+    || type === 'queue-multiagent-offering-end'
+  ))
+
+  for (const stage of multiAgentStages) {
+    nestedEvents[String(stage.id)] = await fetchCompleteCallFlow(accessToken, callID, stage.id)
+  }
+
+  return { events, nestedEvents }
+}
+
 function formatAgentDisplayName(agent) {
   const fullName = [agent.firstName, agent.lastName]
     .map((value) => String(value ?? '').trim())
@@ -350,15 +421,22 @@ async function refreshAgentDirectory(accessToken) {
   })
 
   const agentsById = new Map()
+  const agentsByCcLogin = new Map()
 
   for (const agent of data.content || []) {
-    agentsById.set(String(agent.id), {
+    const normalizedAgent = {
       ...agent,
       displayName: formatAgentDisplayName(agent),
-    })
+    }
+    agentsById.set(String(agent.id), normalizedAgent)
+
+    if (agent.ccLogin !== undefined && agent.ccLogin !== null && agent.ccLogin !== '') {
+      agentsByCcLogin.set(String(agent.ccLogin).trim(), String(agent.id))
+    }
   }
 
   agentDirectory.agentsById = agentsById
+  agentDirectory.agentsByCcLogin = agentsByCcLogin
   agentDirectory.expiresAt = Date.now() + agentCacheTtlMs
 
   console.log(`Loaded ${agentsById.size} Ziwo agents for agent name lookup`)
@@ -688,6 +766,97 @@ async function formatTeamsWorkflowPayload(accessToken, cdr) {
   }
 }
 
+function getAgentTeamMaps() {
+  return buildActiveTeamMaps(agentTeamDirectory.agentsById, agentDirectory.agentsById)
+}
+
+function getAgentDisplayNameById(agentId) {
+  const id = String(agentId)
+  return agentDirectory.agentsById.get(id)?.displayName
+    || agentTeamDirectory.agentsById.get(id)?.agentName
+    || `Agent ${id}`
+}
+
+async function processTransferTeamCalls(accessToken, cdr) {
+  const enabledConfigs = transferTeamConfigs.filter(({ team }) => teamsWebhookUrlsByTeam.has(team))
+  if (cdr?.direction !== 'inbound' || !enabledConfigs.length) {
+    return { recognized: false, sent: 0 }
+  }
+
+  await Promise.all([
+    ensureAgentDirectory(accessToken),
+    ensureAgentTeamDirectory(),
+  ])
+
+  const { teamByAgentId, agentIdsByTeam } = getAgentTeamMaps()
+  for (const { team } of enabledConfigs) {
+    if (!(agentIdsByTeam.get(team) || []).length) {
+      console.warn(`${getTeamDisplayName(team)} direct-transfer processing has no active agent IDs in the team table; queue transfers remain enabled`)
+    }
+  }
+
+  const { handoffs } = await resolveTransferCallFlow({
+    fetchCallFlow: () => fetchCallFlowWithNestedOffers(accessToken, cdr.callID),
+    interpret: ({ events, nestedEvents }) => enabledConfigs.flatMap(({ team, queueIds }) => (
+      interpretSalesTransferCall({
+        cdr,
+        events,
+        nestedEvents,
+        targetQueueIds: queueIds,
+        targetAgentIds: agentIdsByTeam.get(team) || [],
+        teamByAgentId,
+        agentIdByExtension: agentDirectory.agentsByCcLogin,
+      }).map((handoff) => ({ ...handoff, team }))
+    )),
+    hasPotentialEvent: (event) => {
+      const agentId = String(event.agentId ?? agentDirectory.agentsByCcLogin.get(String(event.data ?? '').trim()) ?? '')
+      return enabledConfigs.some(({ team, queueIds }) => (
+        queueIds.includes(String(event.queueId))
+        || (
+          ['transfer', 'attended-transfer'].includes(event.type)
+          && (agentIdsByTeam.get(team) || []).includes(agentId)
+        )
+      ))
+    },
+    retryDelaysMs: transferCallFlowRetryDelaysMs,
+    onRetry: () => {
+      console.log(`Transfer CallFlow not complete for callID=${cdr.callID}; retrying`)
+    },
+  })
+  const missedHandoffs = handoffs.filter(({ status }) => status === 'missed')
+  const incompleteHandoffs = handoffs.filter(({ status }) => status === 'incomplete')
+
+  for (const handoff of incompleteHandoffs) {
+    console.warn(`${getTeamDisplayName(handoff.team)} handoff incomplete for callID=${cdr.callID}, handoff=${handoff.key}; no notification sent`)
+  }
+
+  const deliveryResult = await deliverTransferHandoffs({
+    cdr,
+    handoffs: missedHandoffs,
+    deliveredKeys: deliveredTransferHandoffs,
+    inFlightKeys: inFlightTransferHandoffs,
+    buildPayload: (handoff) => formatTransferWorkflowPayload(cdr, handoff, {
+      teamDisplayName: getTeamDisplayName(handoff.team),
+      formatDateTime,
+      getCallerNumber,
+      getAgentDisplayName: getAgentDisplayNameById,
+      formatText: formatCardText,
+    }),
+    send: (team, payload) => sendTeamsWorkflowMessage(teamsWebhookUrlsByTeam.get(team), payload),
+    onDuplicate: (handoff, deliveryKey) => {
+      console.log(`Skipping duplicate ${getTeamDisplayName(handoff.team)} notification for ${deliveryKey}`)
+    },
+    onSuccess: (handoff) => {
+      console.log(`${getTeamDisplayName(handoff.team)} missed-transfer message sent for callID=${cdr.callID}, handoff=${handoff.key}`)
+    },
+    onFailure: (handoff, deliveryKey, error) => {
+      console.error(`${getTeamDisplayName(handoff.team)} missed-transfer message failed for ${deliveryKey}: ${getErrorMessage(error)}`)
+    },
+  })
+
+  return { recognized: handoffs.length > 0, ...deliveryResult }
+}
+
 async function sendTeamsWorkflowMessage(webhookUrl, payload) {
   await axios.post(webhookUrl, payload, {
     headers: { 'Content-Type': 'application/json' },
@@ -713,6 +882,8 @@ async function main() {
   console.log(`Starting Ziwo missed-call notifier: ${appVersion}`)
   console.log(`Logged in to Ziwo API: ${baseUrl}`)
   console.log(`Listening for live inbound canceled calls with result: ${cancelResults.join(', ')}`)
+  console.log(`Listening for unanswered Sales handoffs to After Sales queue(s): ${afterSalesQueueIds.join(', ')}`)
+  console.log(`Listening for unanswered Sales handoffs to CMR queue(s): ${cmrQueueIds.join(', ')}`)
   console.log('Using Ziwo agent lookup endpoint: GET /callHistory/listAgents?deleted=false')
 
   try {
@@ -763,6 +934,18 @@ async function main() {
 
       console.log(formatCdrFetchLog(cdr))
 
+      let transferTeamRecognized = false
+      try {
+        const transferResult = await processTransferTeamCalls(accessToken, cdr)
+        transferTeamRecognized = transferResult.recognized
+      } catch (error) {
+        console.error(`Transfer CallFlow processing failed for callID=${callID}: ${getErrorMessage(error)}`)
+      }
+
+      if (transferTeamRecognized) {
+        return
+      }
+
       if (isCanceledCall(cdr)) {
         await logCanceledCall(accessToken, cdr, 'socket')
         if (isTeamsConfigured()) {
@@ -779,6 +962,12 @@ async function main() {
                 ? `last contacted ${getContactedAgentLabel(call.lastAssignedCall)}`
                 : (call.agentName || call.agentId)
               console.log(`Skipping Teams message for callID=${callID}: no team mapping found for ${routeLabel}`)
+              return
+            }
+
+            if (['after_sales', 'cmr'].includes(call.team)) {
+              const teamName = getTeamDisplayName(call.team)
+              console.log(`Skipping legacy ${teamName} route for callID=${callID}: only verified Sales transfers can notify ${teamName}`)
               return
             }
 
@@ -809,7 +998,9 @@ async function main() {
   })
 }
 
-main().catch((error) => {
-  console.error(getErrorMessage(error))
-  process.exitCode = 1
-})
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(getErrorMessage(error))
+    process.exitCode = 1
+  })
+}
